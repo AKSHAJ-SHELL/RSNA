@@ -271,15 +271,62 @@ kaggle competitions download -c rsna-knee-abnormality-detection -f train_series.
 `--device` auto-detects CUDA; it is spelled out because a silent fallback to CPU is the failure
 mode worth being loud about.
 
-- **`--amp`** enables bfloat16 autocast, roughly halving step time on Ampere or newer. The loss
-  stays fp32 regardless — bf16 carries about three decimal digits and `weighted_bce` divides by a
-  total weight large enough to lose them. Skip it on GTX 10-series or older, which has no usable
-  bf16.
-- **`--batch 32`** rather than the Mac's 8. The encoder sees `batch x 6` images per step, so that
-  is 192 in flight; drop to 16 on OOM. The M5 was flat from batch 2 to 16 because it saturated
-  immediately — a discrete card will not.
+- **`--amp`** enables bfloat16 autocast, roughly halving step time on Ampere or newer (the 3070
+  qualifies). The loss stays fp32 regardless — bf16 carries about three decimal digits and
+  `weighted_bce` divides by a total weight large enough to lose them. Skip it on GTX 10-series
+  or older, which has no usable bf16.
 - **`--num-workers` stays 0.** The cache is a memmap; workers each fault in their own pages and
   multiply resident memory without hiding any decode work.
+
+### Sizing the batch to your VRAM
+
+The encoder sees `batch x 6` images per step, so batch size costs six times what it looks like.
+
+| VRAM | Card | `--batch` @224px |
+|---|---|---|
+| 8 GB | RTX 3070 / 2080 | **8–16** |
+| 12 GB | RTX 3060 / 4070 | 16–24 |
+| 24 GB | RTX 3090 / 4090 | 32–48 |
+
+Start low and raise it — throughput barely moves above the point where the GPU saturates, so an
+OOM three epochs in costs more than the speed it buys.
+
+### Storage and host RAM
+
+**You do not need room for the raw DICOM.** The ~750–930 GB is decoded on Kaggle and never
+downloaded. Locally you need roughly:
+
+| Item | Size |
+|---|---|
+| Pixel cache @224px x 8 slices | 9.9 GB |
+| venv incl. CUDA torch | ~4 GB |
+| Checkpoints (5 folds) | ~0.5 GB |
+| **Total** | **~15 GB** |
+
+**Host RAM is the real constraint, not disk.** The cache is memory-mapped, so it need not all be
+resident — but training touches every study each epoch, so whatever does not fit in page cache is
+re-read from disk every epoch.
+
+On a 16 GB machine, WSL2's default ceiling of ~50% of system RAM gives 8 GB, which is *less than
+the 9.9 GB cache* and guarantees thrashing. Raise it in `C:\Users\<you>\.wslconfig`, then
+`wsl --shutdown`:
+
+```ini
+[wsl2]
+memory=12GB
+```
+
+That leaves ~10 GB of page cache against a 9.9 GB cache — workable on NVMe, tight. If throughput
+is disappointing, shrink the cache instead of fighting it. Cache size goes as `S x P²`, so:
+
+| Config | Size | Notes |
+|---|---|---|
+| 224px x 8 slices | 9.9 GB | best accuracy; needs ~12 GB WSL |
+| 224px x 4 slices | 4.9 GB | halves slice coverage, keeps resolution |
+| **168px x 8 slices** | **5.6 GB** | comfortable on 16 GB; resolution is the costlier axis |
+
+`scripts/downscale_cache.py` derives a smaller cache from an existing one, so this needs no
+re-decode on Kaggle.
 
 Run several folds unattended:
 
