@@ -66,16 +66,71 @@ def read_meta(root: Path) -> CacheMeta:
     return CacheMeta(**json.loads((root / "meta.json").read_text()))
 
 
-def open_cache(root: str | Path) -> tuple[np.memmap, np.ndarray, pd.Index, CacheMeta]:
-    """Memory-map a cache directory. Never loads the pixels into the process."""
+#: Studies per shard. At 224px x 8 slices x 6 slots this is a little under 1 GB per file.
+#: Kaggle's kernel-output endpoint resets the connection partway through a single ~10 GB file,
+#: and a failed transfer of one shard is retryable while a failed transfer of the whole cache
+#: is three hours of decode thrown away.
+SHARD_STUDIES = 441
+
+
+class ShardedPixels:
+    """Read-only view over pixel shards that indexes like one array.
+
+    Each shard stays an independent memmap, so the OS pages in only what is touched and two
+    processes opening the same cache still share physical pages. Concatenating them into one
+    array would defeat both.
+    """
+
+    def __init__(self, paths: list[Path]):
+        self.shards = [np.load(p, mmap_mode="r") for p in paths]
+        self.counts = [len(s) for s in self.shards]
+        self.offsets = np.cumsum([0] + self.counts)
+        tail = self.shards[0].shape[1:]
+        if any(s.shape[1:] != tail for s in self.shards):
+            raise ValueError("Pixel shards disagree on shape beyond the first axis.")
+        self.shape = (int(self.offsets[-1]), *tail)
+        self.dtype = self.shards[0].dtype
+
+    def __len__(self) -> int:
+        return self.shape[0]
+
+    def __getitem__(self, i: int) -> np.ndarray:
+        shard = int(np.searchsorted(self.offsets, i, side="right") - 1)
+        return self.shards[shard][i - self.offsets[shard]]
+
+    @property
+    def nbytes(self) -> int:
+        return sum(s.nbytes for s in self.shards)
+
+
+def open_cache(root: str | Path):
+    """Memory-map a cache directory. Never loads the pixels into the process.
+
+    Accepts both layouts: a single `pixels.npy`, or `pixels_000.npy`, `pixels_001.npy`, ...
+    """
     root = Path(root)
     meta = read_meta(root)
-    pixels = np.load(root / "pixels.npy", mmap_mode="r")
+
+    single = root / "pixels.npy"
+    shards = sorted(root.glob("pixels_*.npy"))
+    if single.exists() and single.stat().st_size > 0:
+        pixels = np.load(single, mmap_mode="r")
+    elif shards:
+        pixels = ShardedPixels(shards)
+    else:
+        raise FileNotFoundError(
+            f"No pixel data in {root}. Expected pixels.npy or pixels_*.npy. "
+            f"(A zero-byte pixels.npy usually means the download was reset partway.)"
+        )
+
     mask = np.load(root / "mask.npy")
     index = pd.read_parquet(root / "index.parquet")["StudyInstanceUID"]
     expected = (meta.n_studies, meta.n_slots, meta.slices, meta.image_size, meta.image_size)
-    if pixels.shape != expected:
-        raise ValueError(f"pixels.npy is {pixels.shape}, meta.json declares {expected}.")
+    if tuple(pixels.shape) != expected:
+        raise ValueError(
+            f"pixels is {tuple(pixels.shape)}, meta.json declares {expected}. "
+            "A shard is missing or truncated — re-download rather than training on part of it."
+        )
     return pixels, mask, pd.Index(index), meta
 
 
