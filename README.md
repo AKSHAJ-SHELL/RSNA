@@ -193,6 +193,91 @@ config and peak process RSS was 0.6 GB; the 19.8 GB cache dominates, and even 33
 **Efficiency-track read:** inference is 8.6 ms/study at 168 vs 46.1 at 336 — a **5.4× spread**
 for 4× the pixels. Resolution is the dominant lever, confirming the plan's ranking.
 
+## Quickstart — WSL2 + RTX 3070 (8 GB VRAM, 16 GB host RAM)
+
+Run in order. Step 0 needs a WSL restart, so do it first.
+
+```powershell
+# 0. Windows side. WSL2 defaults to ~50% of system RAM = 8 GB, which is LESS than the
+#    9.9 GB cache and guarantees thrashing every epoch.
+#    Put this in C:\Users\<you>\.wslconfig, then run: wsl --shutdown
+#    [wsl2]
+#    memory=12GB
+```
+
+```bash
+# 1. Verify CUDA reaches WSL. Do NOT install an NVIDIA driver inside the distro —
+#    WSL2 uses the Windows driver through /usr/lib/wsl/lib.
+nvidia-smi
+
+# 2. Clone into the LINUX filesystem. /mnt/c goes through 9P and random reads are
+#    ~10x slower; the cache is a memmap read randomly every step.
+cd ~ && git clone https://github.com/AKSHAJ-SHELL/RSNA.git && cd RSNA
+
+# 3. Environment. Torch from the CUDA index FIRST — the default wheel may be CPU-only,
+#    which trains at CPU speed and reports no error.
+curl -LsSf https://astral.sh/uv/install.sh | sh
+source $HOME/.local/bin/env
+uv venv --python 3.12
+uv pip install torch --index-url https://download.pytorch.org/whl/cu124
+uv pip install -e .
+
+.venv/bin/python -c "import torch; print(torch.__version__, torch.cuda.is_available(), torch.cuda.get_device_name(0))"
+.venv/bin/python -m pytest -q          # expect 32 passed
+
+# 4. Kaggle credentials
+mkdir -p ~/.kaggle && cp /mnt/c/Users/<you>/.kaggle/kaggle.json ~/.kaggle/ && chmod 600 ~/.kaggle/kaggle.json
+
+# 5. Targets and folds (data/ is gitignored; regenerating takes under a minute)
+kaggle competitions download -c rsna-knee-abnormality-detection -f train.csv -p data/raw
+kaggle competitions download -c rsna-knee-abnormality-detection -f train_series.csv -p data/raw
+.venv/bin/python scripts/build_targets.py
+
+# 6. Pixel cache from the Kaggle notebook output (~10 GB, sharded)
+kaggle kernels output akshajshandilya/rsna-knee-build-pixel-cache -p data/
+
+# 7. VERIFY THE CACHE BEFORE TRAINING. This raises if any shard is missing or
+#    truncated, rather than letting you train on part of the data.
+.venv/bin/python -c "
+from rsnaknee.cache import open_cache
+px, mask, idx, meta = open_cache('data/cache/r224s8')
+print('pixels    ', px.shape)
+print('studies   ', meta.n_studies)
+print('mean slots', round(float(mask.sum(axis=1).mean()), 2), 'of', meta.n_slots)
+print('empty     ', int((~mask.any(axis=1)).sum()))
+"
+
+# 8. Train one fold. batch 8 for 8 GB VRAM — the encoder sees batch x 6 images per step.
+.venv/bin/python -m rsnaknee.train \
+  --cache data/cache/r224s8 \
+  --targets data/targets/v1.parquet \
+  --folds data/folds.csv \
+  --fold 0 --epochs 30 --batch 8 --image-size 224 \
+  --device cuda --amp --notes "fold0 baseline"
+```
+
+Expected from step 7: `mean slots 4.84 of 6`, `empty 0`. Anything else means a bad download.
+
+If step 8 OOMs, drop to `--batch 4`. If throughput is poor (host RAM thrashing rather than VRAM),
+build the smaller cache once and use it instead — no re-decode:
+
+```bash
+.venv/bin/python scripts/downscale_cache.py --src data/cache/r224s8 --dst data/cache/r168s8 --image-size 168
+```
+
+All five folds unattended, appending to `experiments/runs.csv`:
+
+```bash
+for f in 0 1 2 3 4; do
+  .venv/bin/python -m rsnaknee.train --cache data/cache/r224s8 \
+    --targets data/targets/v1.parquet --folds data/folds.csv \
+    --fold $f --epochs 30 --batch 8 --device cuda --amp --notes "5-fold baseline"
+done
+```
+
+Outputs: `runs/fold<N>/best.pt` (checkpoint + config + cache metadata), `runs/fold<N>/best.json`,
+and one row per run in `experiments/runs.csv` with per-class AUC and inference time.
+
 ## Running on Linux / WSL2 + CUDA
 
 ### Am I on WSL2 or native Ubuntu?
