@@ -26,6 +26,9 @@ dependencies = [
     # tooling
     "tqdm>=4.66",
     "pytest>=8.0",
+    # Needed to fetch the competition CSVs and the pixel cache built by the Kaggle notebook,
+    # so it belongs in the project rather than relying on a system-wide install.
+    "kaggle>=1.6",
 ]
 
 [build-system]
