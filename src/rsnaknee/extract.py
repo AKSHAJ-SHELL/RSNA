@@ -355,8 +355,14 @@ def extract_frame(reports: pd.Series, silence_weight: float = 0.25) -> pd.DataFr
         [{t: r[t].confidence for t in TARGETS} for r in rows], index=reports.index
     )
 
+    # Whether the report actually said something, captured *before* silence weighting fills the
+    # blanks in. Keeping this separate is not bookkeeping: `coverage_rate` infers extractor
+    # blindness from silence, and once every cell carries a non-zero weight it can no longer
+    # tell a real mention from an implied negative — every finding reports identical coverage
+    # and the instrument silently stops measuring anything.
+    mentioned = confidence > 0
+
     if silence_weight > 0:
-        mentioned = confidence > 0
         thoroughness = mentioned.sum(axis=1) / len(TARGETS)
         implied = pd.DataFrame(
             np.outer(silence_weight * thoroughness, np.ones(len(TARGETS))),
@@ -366,4 +372,5 @@ def extract_frame(reports: pd.Series, silence_weight: float = 0.25) -> pd.DataFr
         confidence = confidence.where(mentioned, implied)
 
     confidence.columns = [f"{t}__confidence" for t in TARGETS]
-    return pd.concat([scores, confidence], axis=1)
+    mentioned.columns = [f"{t}__mentioned" for t in TARGETS]
+    return pd.concat([scores, confidence, mentioned], axis=1)

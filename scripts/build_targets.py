@@ -44,16 +44,19 @@ def main() -> None:
     extracted.to_parquet(TARGETS_OUT)
     print(f"wrote {TARGETS_OUT}")
 
-    conf = extracted[[f"{t}__confidence" for t in TARGETS]].set_axis(TARGETS, axis=1)
+    # Coverage must be computed from the *mentioned* flags, not the confidence columns: silence
+    # weighting gives unmentioned cells a small non-zero weight, so `confidence > 0` would report
+    # ~98% coverage for every finding in every language and measure nothing.
+    seen = extracted[[f"{t}__mentioned" for t in TARGETS]].set_axis(TARGETS, axis=1)
 
     print("\n=== positive rate (score > 0.5, among mentioned) ===")
     for t in TARGETS:
-        mentioned = conf[t] > 0
-        rate = (extracted.loc[mentioned, t] > 0.5).mean() if mentioned.any() else float("nan")
-        print(f"  {t:<18} mentioned {mentioned.mean():>5.1%}   positive-if-mentioned {rate:>5.1%}")
+        m = seen[t]
+        rate = (extracted.loc[m, t] > 0.5).mean() if m.any() else float("nan")
+        print(f"  {t:<18} mentioned {m.mean():>5.1%}   positive-if-mentioned {rate:>5.1%}")
 
     print("\n=== coverage by language (fraction of reports where the finding was mentioned) ===")
-    cov = coverage_rate(conf, langs)
+    cov = coverage_rate(seen.astype(float), langs)
     print(cov[COMMONLY_REPORTED + ["n"]].round(3).to_string())
 
     print("\n  ^ these four are findings a knee report almost always comments on.")
