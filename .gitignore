@@ -1,0 +1,31 @@
+# Data — never commit. Raw DICOM is ~700GB+ server-side; CSVs are competition-licensed.
+data/
+!data/.gitkeep
+
+# Third-party notebooks pulled for reference. Not committed: their licenses are unverified
+# (kernel-metadata.json returns licenseName: None), so redistributing them here would be a
+# provenance claim we cannot yet support. See ATTRIBUTION.md.
+vendor/
+
+# Caches / artifacts
+cache/
+*.npy
+*.npz
+*.dcm
+*.parquet
+*.pt
+*.pth
+oof/
+submissions/
+
+# Python
+.venv/
+__pycache__/
+*.py[cod]
+.ipynb_checkpoints/
+.pytest_cache/
+.ruff_cache/
+*.egg-info/
+
+# OS
+.DS_Store
