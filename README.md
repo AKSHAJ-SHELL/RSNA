@@ -193,72 +193,106 @@ config and peak process RSS was 0.6 GB; the 19.8 GB cache dominates, and even 33
 **Efficiency-track read:** inference is 8.6 ms/study at 168 vs 46.1 at 336 — a **5.4× spread**
 for 4× the pixels. Resolution is the dominant lever, confirming the plan's ranking.
 
-## Running on Windows + CUDA
+## Running on Linux / WSL2 + CUDA
+
+### Am I on WSL2 or native Ubuntu?
+
+```bash
+grep -qi microsoft /proc/version && echo "WSL2" || echo "native Linux"
+nvidia-smi          # must work before anything below; shows driver + CUDA version
+```
+
+Two WSL2-specific traps, both of which cost far more than they look:
+
+**Do not install an NVIDIA driver inside WSL.** WSL2 uses the *Windows* driver through
+`/usr/lib/wsl/lib`. Installing a Linux driver in the distro overwrites that shim and breaks CUDA
+in a way that is tedious to undo. `nvidia-smi` working inside WSL means it is already correct.
+
+**Clone into the Linux filesystem, never `/mnt/c`.** Windows-mounted paths go through the 9P
+protocol, and random reads run roughly an order of magnitude slower. The pixel cache is a ~10 GB
+memmap read randomly every step, so putting the repo on `/mnt/c` turns a GPU-bound job into an
+IO-bound one. `~/RSNA` is right; `/mnt/c/Users/...` is not.
+
+Also check WSL2's memory ceiling — it defaults to about half of Windows RAM, and the memmap
+needs to stay resident. Raise it in `C:\Users\<you>\.wslconfig`, then `wsl --shutdown`:
+
+```ini
+[wsl2]
+memory=32GB
+```
 
 ### Setup
 
-```powershell
-git clone https://github.com/AKSHAJ-SHELL/RSNA.git
-cd RSNA
+```bash
+cd ~ && git clone https://github.com/AKSHAJ-SHELL/RSNA.git && cd RSNA
 
-winget install --id=astral-sh.uv -e     # or: pip install uv
+curl -LsSf https://astral.sh/uv/install.sh | sh
 uv venv --python 3.12
 ```
 
-**Install torch from the CUDA index, before anything else.** On Windows the default PyPI wheel
-is **CPU-only**, so `uv pip install -e .` alone yields a torch that reports
-`cuda.is_available() == False` and trains at CPU speed with no error message.
+Install torch from the CUDA index **before** the package. The default PyPI wheel resolves to a
+build that may not match your driver, and a CPU-only torch trains at CPU speed while reporting
+no error at all.
 
-```powershell
+```bash
 uv pip install torch --index-url https://download.pytorch.org/whl/cu124
 uv pip install -e .
+
+.venv/bin/python -c "import torch; print(torch.__version__, torch.cuda.is_available(), torch.cuda.get_device_name(0))"
+.venv/bin/python -m pytest -q
 ```
 
-Match the index to your driver: `cu121`, `cu124`, or `cu128`. Check with `nvidia-smi`.
+Match the index to `nvidia-smi`: `cu121`, `cu124`, or `cu128`.
 
-```powershell
-.venv\Scripts\python.exe -c "import torch; print(torch.__version__, torch.cuda.is_available(), torch.cuda.get_device_name(0))"
-.venv\Scripts\python.exe -m pytest -q
+### Targets and folds
+
+`data/` is gitignored, so regenerate after cloning — under a minute, needs only `train.csv`:
+
+```bash
+pip install --user kaggle          # or: uv pip install kaggle
+mkdir -p ~/.kaggle && cp /mnt/c/Users/<you>/.kaggle/kaggle.json ~/.kaggle/ && chmod 600 ~/.kaggle/kaggle.json
+
+kaggle competitions download -c rsna-knee-abnormality-detection -f train.csv -p data/raw
+kaggle competitions download -c rsna-knee-abnormality-detection -f train_series.csv -p data/raw
+.venv/bin/python scripts/build_targets.py
 ```
 
 ### Train
 
-```powershell
-.venv\Scripts\python.exe -m rsnaknee.train `
-  --cache data\cache\r224s8 `
-  --targets data\targets\v1.parquet `
-  --folds data\folds.csv `
-  --fold 0 --epochs 30 --batch 32 --image-size 224 `
+```bash
+.venv/bin/python -m rsnaknee.train \
+  --cache data/cache/r224s8 \
+  --targets data/targets/v1.parquet \
+  --folds data/folds.csv \
+  --fold 0 --epochs 30 --batch 32 --image-size 224 \
   --device cuda --amp
 ```
 
-`--device` already defaults to CUDA when it is available; it is spelled out above because a
-silent fallback to CPU is the failure mode worth being loud about.
+`--device` auto-detects CUDA; it is spelled out because a silent fallback to CPU is the failure
+mode worth being loud about.
 
-Notes specific to this machine and OS:
-
-- **`--amp`** enables bfloat16 autocast, which roughly halves step time on Ampere or newer. The
-  loss is computed in fp32 regardless — bf16 carries about three decimal digits, and the
-  weighted sum here divides by a total weight large enough to lose them. Skip `--amp` on GTX
-  10-series or older, which has no usable bf16.
-- **`--batch 32`** rather than the Mac's 8. The encoder sees `batch x 6` images per step, so 32
-  means 192 images in flight; drop to 16 if you hit OOM. On the M5 throughput was flat from 2 to
-  16 because the GPU saturated almost immediately — a discrete CUDA card will not.
+- **`--amp`** enables bfloat16 autocast, roughly halving step time on Ampere or newer. The loss
+  stays fp32 regardless — bf16 carries about three decimal digits and `weighted_bce` divides by a
+  total weight large enough to lose them. Skip it on GTX 10-series or older, which has no usable
+  bf16.
+- **`--batch 32`** rather than the Mac's 8. The encoder sees `batch x 6` images per step, so that
+  is 192 in flight; drop to 16 on OOM. The M5 was flat from batch 2 to 16 because it saturated
+  immediately — a discrete card will not.
 - **`--num-workers` stays 0.** The cache is a memmap; workers each fault in their own pages and
-  multiply resident memory without hiding any decode work. Windows uses spawn rather than fork,
-  which makes workers more expensive here, not less.
-- **Paths use backslashes** and PowerShell continues lines with a backtick, not `\`.
+  multiply resident memory without hiding any decode work.
 
-### Generating targets and folds on Windows
+Run several folds unattended:
 
-`data/targets/v1.parquet` and `data/folds.csv` are gitignored, so regenerate them after cloning
-— it takes under a minute and needs only `train.csv`:
-
-```powershell
-kaggle competitions download -c rsna-knee-abnormality-detection -f train.csv -p data\raw
-kaggle competitions download -c rsna-knee-abnormality-detection -f train_series.csv -p data\raw
-.venv\Scripts\python.exe scripts\build_targets.py
+```bash
+for f in 0 1 2 3 4; do
+  .venv/bin/python -m rsnaknee.train --cache data/cache/r224s8 \
+    --targets data/targets/v1.parquet --folds data/folds.csv \
+    --fold $f --epochs 30 --batch 32 --device cuda --amp --notes "5-fold baseline"
+done
 ```
+
+Every run appends to `experiments/runs.csv`, so per-class AUC, fold spread and inference time
+are all comparable afterwards.
 
 ## Open items
 
